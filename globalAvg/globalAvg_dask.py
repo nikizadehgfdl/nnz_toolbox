@@ -2,18 +2,24 @@
 """
 Calculates global averages from postprocessed data.
 Usage example:
-    python ./globalAvg_torch.py 
+    python ./globalAvg_dask.py 
     --inputfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.thetao.nc
     --vars thetao
     --staticfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000101-000512.volcello.nc
     --outputfile ./ESM4.5v14.000601-001012.thetao.global.nc
-    --device cpu
+ either:
+       --device cpu      #This can be 'cpu' or 'cuda' if torch with cuda is available, otherwise omit this argument to use numpy
+ or:
+       --dask_workers 4  #number of Dask workers, omit to not use Dask 
+       --mem 16GB
+       --chunk-time 1
 
 
 This script will:
-- Start a local Dask LocalCluster
+- Optionally start a local Dask LocalCluster
+- If using dask, chunk along the time dimension and compute weighted spatial means in parallel
 - Load `volcello` (grid cell volume) and variables (e.g. thetao, so)
-- Chunk along the time dimension and compute weighted spatial means in parallel
+- Compute weighted global means for each time index using either numpy or torch or dask
 - Save the resulting time series to a NetCDF file
 
 Requirements:
@@ -214,4 +220,8 @@ if __name__ == '__main__':
 #Torch CPU
 #python ../globalAvg/globalAvg_dask.py --inputfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.thetao.nc --staticfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.volcello.nc --outputfile ./ESM4.5v14.000601-001012.numpy.global.nc --vars thetao --device cpu
 #2026-01-08 16:16:40,472 INFO: It took 37 seconds to run on host an206 using device cpu, average value: 3.545720
+#
+#python ../globalAvg/globalAvg_dask.py --inputfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.thetao.nc --staticfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.volcello.nc --outputfile ./ESM4.5v14.000601-001012.global.nc --vars thetao  --device cuda
+#2026-01-08 16:51:57,141 INFO: It took 43 seconds to run on host pp400 using device cuda, average value: 3.545720
+#2026-01-08 16:53:55,515 INFO: It took 45 seconds to run on host pp400 using device cpu, average value: 3.545720
 #
