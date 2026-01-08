@@ -197,32 +197,21 @@ if __name__ == '__main__':
 
 
 #command line example and timings:
+#PAN an206:
 #module load conda;conda activate /nbhome/Niki.Zadeh/opt/miniconda3/envs/plattorch
-#(plattorch) Niki.Zadeh: /nbhome/Niki.Zadeh/projects/python_tools/workdir $ python /nbhome/Niki.Zadeh/projects/python_tools/globalAvg/globalAvg_torch.py --inputfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.thetao.nc --staticfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.volcello.nc --outputfile ./ESM4.5v14.000601-001012.numpy.global.nc --vars thetao --device cpu
-#2026-01-07 13:36:40,386 INFO: Using torch with device: cpu
-#2026-01-07 13:36:40,386 INFO: Loading volcello from /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.volcello.nc
-#2026-01-07 13:38:57,141 INFO: Opening variable dataset: /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.thetao.nc
-#2026-01-07 13:44:38,545 INFO: Saving results to ./ESM4.5v14.000601-001012.numpy.global.nc
-#2026-01-07 13:44:38,545 INFO: Saving results to ./ESM4.5v14.000601-001012.numpy.global_annual.nc
-#2026-01-07 13:44:38,545 INFO: Writing output to ./ESM4.5v14.000601-001012.numpy.global.nc using format=NETCDF3_CLASSIC
-#2026-01-07 13:44:38,551 INFO: Saved output to ./ESM4.5v14.000601-001012.numpy.global.nc
-#2026-01-07 13:44:38,551 INFO: Writing output to ./ESM4.5v14.000601-001012.numpy.global_annual.nc using format=NETCDF3_CLASSIC
-#2026-01-07 13:44:38,554 INFO: Saved output to ./ESM4.5v14.000601-001012.numpy.global_annual.nc
-#torchCPU timings:
-#2026-01-07 13:44:38,554 INFO: It took 478 seconds to run on host an206 using device cpu
-#2026-01-07 13:53:21,424 INFO: It took 37 seconds to run on host an206 using device cpu
-#2026-01-07 13:56:10,938 INFO: It took 80 seconds to run on host an206 using device cpu
-#2026-01-07 17:03:22,002 INFO: It took 36 seconds to run on host an206 using device cpu, average value: 3.545720
-#The following were run on pp400, but the gpu was busy with other jobs:
-#2026-01-08 12:02:19,128 INFO: It took 292 seconds to run on host pp400 using device cpu, average value: 3.545720
-#2026-01-08 12:12:40,181 INFO: It took 281 seconds to run on host pp400 using device cuda, average value: 3.545720
+#Dask
+#python ../globalAvg/globalAvg_dask.py --inputfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.thetao.nc --staticfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.volcello.nc --outputfile ./ESM4.5v14.000601-001012.dask.global.nc --vars thetao  --dask_workers 2 --mem 16GB --chunk-time 1
+#...
+#2026-01-08 15:51:01,850 INFO: Starting Dask LocalCluster: workers=2 threads=1 mem=16GB
+#... 
+#2026-01-08 15:52:56,977 INFO: It took 112 seconds to run on host an206 using device None, using 2 dask workers, average value: 3.545721
+#Repeat with --dask_workers 6 
+#2026-01-08 15:57:28,664 INFO: It took 126 seconds to run on host an206 using device None, using 6 dask workers, average value: 3.545721
+#2026-01-08 15:59:52,550 INFO: It took 91 seconds to run on host an206 using device None, using 12 dask workers, average value: 3.545721
+#Numpy
+#python ../globalAvg/globalAvg_dask.py --inputfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.thetao.nc --staticfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.volcello.nc --outputfile ./ESM4.5v14.000601-001012.numpy.global.nc --vars thetao
+#2026-01-08 16:14:58,448 INFO: It took 38 seconds to run on host an206 using device None, average value: 3.545721
+#Torch CPU
+#python ../globalAvg/globalAvg_dask.py --inputfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.thetao.nc --staticfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.volcello.nc --outputfile ./ESM4.5v14.000601-001012.numpy.global.nc --vars thetao --device cpu
+#2026-01-08 16:16:40,472 INFO: It took 37 seconds to run on host an206 using device cpu, average value: 3.545720
 #
-#numpyCPU timings:
-#2026-01-07 13:51:30,145 INFO: It took 78 seconds to run on host an206 using device None
-#2026-01-07 13:59:34,300 INFO: It took 88 seconds to run on host an206 using device None
-#2026-01-07 17:02:09,398 INFO: It took 108 seconds to run on host an206 using device None, average value: 3.545721
-
-#python /nbhome/Niki.Zadeh/projects/python_tools/globalAvg/globalAvg_dask.py --inputfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.thetao.nc --staticfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.volcello.nc --outputfile ./ESM4.5v14.000601-001012.dask1.global.nc --vars thetao  --dask_workers 2 --mem 16GB --chunk-time 1
-#2026-01-07 16:41:31,606 INFO: It took 200 seconds to run on host an206 using device None, using 2 workers, average value: 3.545721
-#2026-01-07 16:43:44,976 INFO: It took  89 seconds to run on host an206 using device None, using 6 workers, average value: 3.545721
-#2026-01-07 16:46:10,299 INFO: It took 98 seconds to run on host an206 using device None, using 12 workers, average value: 3.545721

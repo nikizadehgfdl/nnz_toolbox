@@ -1,0 +1,12 @@
+#The following example were run on GFDL PAN 
+module load conda;conda activate /nbhome/Niki.Zadeh/opt/miniconda3/envs/plattorch
+cd workdir
+#Use dask with 12 workers
+python ../globalAvg/globalAvg_dask.py --inputfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.thetao.nc --staticfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.volcello.nc --outputfile ./ESM4.5v14.000601-001012.global.nc --vars thetao  --dask_workers 12 --mem 16GB --chunk-time 1
+#Use Numpy
+python ../globalAvg/globalAvg_dask.py --inputfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.thetao.nc --staticfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.volcello.nc --outputfile ./ESM4.5v14.000601-001012.global.nc --vars thetao 
+#Use pyTorch with CPU
+python ../globalAvg/globalAvg_dask.py --inputfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.thetao.nc --staticfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.volcello.nc --outputfile ./ESM4.5v14.000601-001012.global.nc --vars thetao --device cpu
+#Use pyTorch with GPU
+python ../globalAvg/globalAvg_dask.py --inputfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.thetao.nc --staticfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.volcello.nc --outputfile ./ESM4.5v14.000601-001012.global.nc --vars thetao --device cuda
+
