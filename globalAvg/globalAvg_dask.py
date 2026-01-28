@@ -53,7 +53,8 @@ def compute_global_avg(inputfile: str,
                        time_chunk: int = 1,
                        outpath: str = None,
                        device: str = None,
-                       ncformat: str = "NETCDF3_CLASSIC"):
+                       ncformat: str = "NETCDF3_CLASSIC",
+                       spatial_block_size: int = 1024):
 
     use_torch = True if device=="cuda" or device=="cpu" else False
 
@@ -81,7 +82,7 @@ def compute_global_avg(inputfile: str,
         # Load volcello (weights)
         volcello_file = staticfile
         logger.info("Loading volcello from %s", volcello_file)
-        ds_vol = xr.open_dataset(volcello_file)
+        ds_vol = xr.open_dataset(volcello_file,chunks=-1) # decode_times=False
         volcello = ds_vol['volcello'][-1].fillna(0)
 
         # total volume (scalar)
@@ -92,16 +93,22 @@ def compute_global_avg(inputfile: str,
             totalvolume = np.sum(volcello.values)
 
         logger.info("Opening variable dataset: %s", inputfile)
-        ds_var = xr.open_dataset(inputfile)
+        ds_var = xr.open_dataset(inputfile, chunks={tdim: time_chunk}) # decode_times=False
 
         for var in vars_to_process:
-            var_da = ds_var[var][:].fillna(0)
+            # Don't load entire array at once - use lazy loading
+            var_da = ds_var[var]  # Don't use [:] yet
             global_avg_da = []
+            
+            # Get dimension info without loading data
+            xsize = var_da.sizes[xdim]
+            ysize = var_da.sizes[ydim]
+            ntimes = var_da.sizes[tdim]
+            print("Debug: variable ", var, " sizes: time=", ntimes, ", y=", ysize, ", x=", xsize)
             # Compute weighted global mean per time index
             # Use explicit multiplication to avoid potential xarray.weighted memory issues
 
             if(n_workers is not None): #use dask          
-                var_da = var_da.chunk({tdim: time_chunk})
                 logger.info("Chunked variable %s with %s=%s", var_da.name, tdim, time_chunk)
                 ##Cannot mix torch and dask: global_mean.compute() AttributeError: 'Tensor' object has no attribute 'compute'
                 ##var_torch = torch.from_numpy(var_da.values).to(device)
@@ -116,19 +123,40 @@ def compute_global_avg(inputfile: str,
                 #print("dask mean: ",global_avg[var].mean().values)
             
             elif(use_torch):
-                for t in range(var_da.sizes[tdim]):
-                    var_torch = torch.from_numpy(var_da[t].values).to(device)
-                    weighted_sum = torch.sum(var_torch * volcello_torch)
+                # Process in time chunks to fit memory
+                dim_indices = [list(var_da.dims).index(d) for d in [xdim, ydim, zdim] if d in var_da.dims] # gives [3, 2, 1]
+                chunk_time_size = min(time_chunk, ntimes)
+                for t_start in range(0, ntimes, chunk_time_size):
+                    print("Processing time chunks: ", t_start, " to ", min(t_start + chunk_time_size, ntimes), " of ", ntimes)
+                    t_end = min(t_start + chunk_time_size, ntimes)
+                    # Load only this time chunk
+                    var_chunk = var_da.isel({tdim: slice(t_start, t_end)}).fillna(0).values
+                    #var_chunk[np.isnan(var_chunk)] = 0 #Instead of .fillna(0) above, but is slower
+                    varchunk_GB = var_chunk.nbytes / (1024**3)
+                    print(f"Variable {var} chunk size in GB: {varchunk_GB:.2f} GB, shape: {var_chunk.shape}")
+                    if varchunk_GB > 35:
+                        print("Chunk too big to fit in memory, reduce time_chunk size")
+                        break
+                    var_torch = torch.from_numpy(var_chunk).to(device)
+                    #var_torch[torch.isnan(var_torch)] = 0 #Instead of .fillna(0) above, but tries to allocate additional memory on GPU and cause crash
+                    var_torch.mul_(volcello_torch) #use in-place multiplication to save memory
+                    weighted_sum = torch.sum(var_torch, dim=dim_indices)
                     global_avg_da.append(weighted_sum / totalvolume)
-                global_avg[var] = xr.DataArray(torch.stack(global_avg_da).cpu().numpy(), dims=[tdim], coords={tdim: var_da[tdim]}, name=var)  
-                #print("torch mean: ",global_avg[var].mean().values)
+                    del var_torch
+                global_avg[var] = xr.DataArray(torch.cat(global_avg_da).cpu().numpy(), dims=[tdim], coords={tdim: var_da[tdim]}, name=var)
+                #global_avg[var] = xr.DataArray(np.array(global_avg_da), dims=[tdim], coords={tdim: var_da[tdim]}, name=var)  
             else:
-                for t in range(var_da.sizes[tdim]):
-                    var_np = var_da[t].values
-                    weighted_sum = np.sum(var_np * volcello.values)
-                    global_avg_da.append(weighted_sum / totalvolume)
-                global_avg[var] = xr.DataArray(np.stack(global_avg_da), dims=[tdim], coords={tdim: var_da[tdim]}, name=var)  
-                #print("numpy mean: ",global_avg[var].mean().values)
+                dim_indices = tuple(var_da.dims.index(d) for d in [xdim, ydim, zdim] if d in var_da.dims)
+                chunk_time_size = min(time_chunk, ntimes)
+                for t_start in range(0, ntimes, chunk_time_size):
+                    print("Processing time chunks: ", t_start, " to ", min(t_start + chunk_time_size, ntimes), " of ", ntimes)
+                    t_end = min(t_start + chunk_time_size, ntimes)
+                    # Load only this time chunk
+                    var_chunk = var_da.isel({tdim: slice(t_start, t_end)}).fillna(0).values
+                    weighted_sum = np.sum(var_chunk * volcello.values, axis=dim_indices)
+                    # Flatten to ensure 1D per time step
+                    global_avg_da.extend(weighted_sum.flatten() / totalvolume)
+                global_avg[var] = xr.DataArray(np.array(global_avg_da), dims=[tdim], coords={tdim: var_da[tdim]}, name=var)  
             
             #Compute annual means                
             globalAvgAnnual[var] = global_avg[var].resample(time='AS').mean(dim='time')
@@ -180,8 +208,9 @@ def main():
     parser.add_argument("--ncformat", default="NETCDF3_CLASSIC", help="netCDF format to write: NETCDF3_CLASSIC, NETCDF4, NETCDF4_CLASSIC")
     parser.add_argument("--device", default=None, help="Device to use: 'cpu' or 'cuda'")
     parser.add_argument("--dask_workers", type=int, default=None, help="Number of Dask workers")
-    parser.add_argument("--mem", default="8GB", help="Memory limit per Dask worker")
-    parser.add_argument("--chunk-time", type=int, default=1, help="Time chunk size for processing")   
+    parser.add_argument("--mem", default="16GB", help="Memory limit per Dask worker")
+    parser.add_argument("--chunk_time", type=int, default=1, help="Time chunk size for processing")   
+    parser.add_argument("--spatial_block_size", type=int, default=1024, help="Spatial block size for processing")   
     args = parser.parse_args()
 
     if(args.device=="cuda" and not torch.cuda.is_available()):
@@ -195,7 +224,8 @@ def main():
                        time_chunk=args.chunk_time,
                        outpath=args.outputfile,
                        device=args.device,
-                       ncformat=args.ncformat)
+                       ncformat=args.ncformat,
+                       spatial_block_size=args.spatial_block_size)
 
 
 if __name__ == '__main__':
@@ -203,25 +233,32 @@ if __name__ == '__main__':
 
 
 #command line example and timings:
-#PAN an206:
-#module load conda;conda activate /nbhome/Niki.Zadeh/opt/miniconda3/envs/plattorch
-#Dask
-#python ../globalAvg/globalAvg_dask.py --inputfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.thetao.nc --staticfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.volcello.nc --outputfile ./ESM4.5v14.000601-001012.dask.global.nc --vars thetao  --dask_workers 2 --mem 16GB --chunk-time 1
-#...
-#2026-01-08 15:51:01,850 INFO: Starting Dask LocalCluster: workers=2 threads=1 mem=16GB
-#... 
-#2026-01-08 15:52:56,977 INFO: It took 112 seconds to run on host an206 using device None, using 2 dask workers, average value: 3.545721
-#Repeat with --dask_workers 6 
-#2026-01-08 15:57:28,664 INFO: It took 126 seconds to run on host an206 using device None, using 6 dask workers, average value: 3.545721
-#2026-01-08 15:59:52,550 INFO: It took 91 seconds to run on host an206 using device None, using 12 dask workers, average value: 3.545721
-#Numpy
-#python ../globalAvg/globalAvg_dask.py --inputfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.thetao.nc --staticfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.volcello.nc --outputfile ./ESM4.5v14.000601-001012.numpy.global.nc --vars thetao
-#2026-01-08 16:14:58,448 INFO: It took 38 seconds to run on host an206 using device None, average value: 3.545721
-#Torch CPU
-#python ../globalAvg/globalAvg_dask.py --inputfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.thetao.nc --staticfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.volcello.nc --outputfile ./ESM4.5v14.000601-001012.numpy.global.nc --vars thetao --device cpu
-#2026-01-08 16:16:40,472 INFO: It took 37 seconds to run on host an206 using device cpu, average value: 3.545720
+#small and fast test
+#python /nbhome/Niki.Zadeh/projects/nnz_toolbox/globalAvg/globalAvg_dask.py --inputfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.thetao.nc --staticfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.volcello.nc --outputfile ./ESM4.5v14.000601-001012.numpy.global.nc --vars thetao --device cpu --chunk_time 10
+#2026-01-28 12:07:08,679 INFO: It took 41 seconds to run on host pp401 using device cpu, average value: 3.545720
+#2026-01-28 12:08:44,431 INFO: It took 29 seconds to run on host pp401 using device cuda, average value: 3.545720
+#2026-01-28 12:37:01,820 INFO: It took 47 seconds to run on host pp401 using device None, average value: 3.545721
 #
-#python ../globalAvg/globalAvg_dask.py --inputfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.thetao.nc --staticfile /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.volcello.nc --outputfile ./ESM4.5v14.000601-001012.global.nc --vars thetao  --device cuda
-#2026-01-08 16:51:57,141 INFO: It took 43 seconds to run on host pp400 using device cuda, average value: 3.545720
-#2026-01-08 16:53:55,515 INFO: It took 45 seconds to run on host pp400 using device cpu, average value: 3.545720
+#Large and slow test
+#python /nbhome/Niki.Zadeh/projects/nnz_toolbox/globalAvg/globalAvg_dask.py --inputfile ./ocean_monthly_z.000101-000512.thetao.nc --staticfile ./ocean_monthly_z.000101-000512.volcello.nc --outputfile ./CM5hires.global.nc --vars thetao --dask_workers 10
 #
+### files on /work
+##dask
+#2026-01-28 09:05:50,297 INFO: It took 598 seconds to run on host pp401 using device None, using 2 dask workers, average value: 3.569357
+#2026-01-28 08:53:03,875 INFO: It took 314 seconds to run on host pp401 using device None, using 10 dask workers, average value: 3.569357
+#torch and numpy
+#2026-01-28 15:19:36,819 INFO: It took 996 seconds to run on host pp401 using device None, average value: 3.569357
+#2026-01-28 15:38:39,663 INFO: It took 1017 seconds to run on host pp401 using device cpu, average value: 3.569368
+#2026-01-28 16:05:36,604 INFO: It took 1081 seconds to run on host pp401 using device cuda, average value: 3.569368
+###files on /xtmp
+##dask
+#2026-01-28 09:13:00,248 INFO: It took 367 seconds to run on host pp401 using device None, using 2 dask workers, average value: 3.569357
+#2026-01-28 09:34:10,901 INFO: It took 219 seconds to run on host pp401 using device None, using 10 dask workers, average value: 3.569357
+#2026-01-28 11:13:09,348 INFO: It took 227 seconds to run on host pp401 using device None, using 12 dask workers, average value: 3.569357
+#2026-01-28 11:03:08,702 INFO: It took 224 seconds to run on host pp401 using device None, using 20 dask workers, average value: 3.569357
+#torch and numpy
+#2026-01-28 12:47:37,782 INFO: It took 506 seconds to run on host pp401 using device cuda, average value: 3.569368
+#2026-01-28 13:08:57,732 INFO: It took 432 seconds to run on host pp401 using device cuda, average value: nan without .fillna(0)
+#2026-01-28 14:26:14,552 INFO: It took 529 seconds to run on host pp401 using device cuda, average value: 3.569368
+#2026-01-28 14:46:06,630 INFO: It took 600 seconds to run on host pp401 using device cpu, average value: 3.569368
+#2026-01-28 15:01:40,458 INFO: It took 673 seconds to run on host pp401 using device None, average value: 3.569357
