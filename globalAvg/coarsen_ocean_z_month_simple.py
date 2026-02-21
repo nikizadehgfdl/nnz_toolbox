@@ -356,6 +356,24 @@ def save_timeslice(ds,i,n,ntime):
     print('process id:', os.getpid(),fout_tmp)
     ds.isel(time=slice(i,min(i+n,ntime))).to_netcdf(fout_tmp,unlimited_dims=['time',],compute=True)
 
+def save_dataset_dask(ds, path, unlimited_dims=['time']):
+    """Write Dataset via xarray+dask: to_netcdf(compute=False) then dask.compute."""
+    print(f"Saving dataset via dask to {path}")
+    try:
+        delayed = ds.to_netcdf(path, mode='w', unlimited_dims=unlimited_dims, compute=False)
+    except TypeError:
+        # backend doesn't support delayed write
+        print("Backend doesn't support delayed write; performing direct write")
+        return ds.to_netcdf(path, unlimited_dims=unlimited_dims)
+
+    try:
+        import dask
+        dask.compute(delayed)
+    except Exception as e:
+        print("Dask compute failed, falling back to direct write:", e)
+        return ds.to_netcdf(path, unlimited_dims=unlimited_dims)
+    
+##########################    
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='''Script for implied atmospheric meridional moisture transport.''')
     parser.add_argument('-f','--filename', type=str, default='foo.nc', help='''filename ''')
@@ -367,6 +385,7 @@ if __name__ == "__main__":
     parser.add_argument('--wrapx', type=bool, default=True, help='''True if the x-component is reentrant''')
     parser.add_argument('--wrapy', type=bool, default=False, help='''True if the y-component is reentrant''')
     parser.add_argument('--dask_workers', type=int, default=0, help='''Number of Dask workers to use. Default is 1, which means no Dask parallelization.''')
+    parser.add_argument('--dask_write', action='store_true', help='Use dask to perform the final to_netcdf write (to_netcdf(compute=False) then compute)')
 
     args = parser.parse_args()
 
@@ -383,7 +402,7 @@ if __name__ == "__main__":
     if(args.dask_workers > 1):
         # Start Dask cluster
         from dask.distributed import Client, LocalCluster
-        memory_limit = '16GB'
+        memory_limit = '32GB' #32G seems to be eough for 1/12th degree ocean data on PAN
         print("Starting Dask LocalCluster: workers=%s threads=%s mem=%s",
                 n_workers, threads_per_worker, memory_limit)
         cluster = LocalCluster(n_workers=n_workers, threads_per_worker=threads_per_worker, memory_limit=memory_limit)
@@ -507,27 +526,33 @@ if __name__ == "__main__":
     tstart=range(0,ntime,chunk_size)
 
     serial_write = True
-    if serial_write:
-        # Serial writes (no child processes)
-        for n in np.arange(nchunks):
-            print(f"Writing chunk {n} starting at time index {tstart[n]}", flush=True)
-            try:
-                save_timeslice(ds_out, tstart[n], chunk_size, ntime)
-            except Exception as e:
-                print(f"Error writing chunk {n}: {e}", flush=True)
-        print('Serial write complete.')
-    else:
-        p=[]
-        for n in np.arange(nchunks):
-            p.append(multiprocessing.Process(target=save_timeslice,args=(ds_out,tstart[n],chunk_size,ntime)))
-        print("Deubg: Here1")
-        for p_ in p:
-            p_.start()
-        print("Deubg: Here2")
-        for p_ in p:
-            p_.join()
-        print(' Multicore write process complete.')
 
+    if args.dask_write:
+        # single-file write via dask (parallel if a Dask client is active)
+        save_dataset_dask(ds_out, path_out)
+    else:
+        if serial_write:
+            # Serial writes (no child processes)
+            for n in np.arange(nchunks):
+                print(f"Writing chunk {n} starting at time index {tstart[n]}", flush=True)
+                try:
+                    save_timeslice(ds_out, tstart[n], chunk_size, ntime)
+                except Exception as e:
+                    print(f"Error writing chunk {n}: {e}", flush=True)
+            print('Serial write complete.')
+        else:
+            p=[]
+            for n in np.arange(nchunks):
+                p.append(multiprocessing.Process(target=save_timeslice,args=(ds_out,tstart[n],chunk_size,ntime)))
+            print("Deubg: Here1")
+            for p_ in p:
+                p_.start()
+            print("Deubg: Here2")
+            for p_ in p:
+                p_.join()
+            print(' Multicore write process complete.')
+
+    checksum = sum([sum_to_scalar(d) for d in dA_i]) + sum([sum_to_scalar(d) for d in dA_e])
 
     rss = print_mem('At the end of the script')
     t2 = time.time()
@@ -630,6 +655,20 @@ if __name__ == "__main__":
 #block_coarsen_da_yx thetao: use dask coarsen
 #  Compute took 136 seconds to run on host pp401 using device cpu, consumed memory  6.30 GB, using 1 dask workers, checksum: 5668890624.0
 #  It took 148 seconds to run on host pp401 using device cpu, consumed memory  6.31 GB, using 1 dask workers, checksum: 5668890624.0
+#block_coarsen_da_yx thetao: use dask coarsen with dask_write into single file:
+#  It took 208 seconds to run on host pp401 using device cpu, consumed memory  0.69 GB, using 1 dask workers, checksum: 5668873216.0
+#  suspect, checksum is different
+#block_coarsen_da_yx thetao: use dask coarsen with serial write and memory_limit 32GB:
+#   Compute took 144 seconds to run on host pp401 using device cpu, consumed memory  6.30 GB, using 1 dask workers, checksum: 5668890624.0   
+#   It took 160 seconds to run on host pp401 using device cpu, consumed memory  6.31 GB, using 1 dask workers, checksum: 5668890624.0
+#   Compute took 139 seconds to run on host pp401 using device cpu, consumed memory  6.55 GB, using 2 dask workers, checksum: 5668890624.0
+#   It took 154 seconds to run on host pp401 using device cpu, consumed memory  6.14 GB, using 2 dask workers, checksum: 5668890624.0
+#   Compute took 106 seconds to run on host pp401 using device cpu, consumed memory  6.96 GB, using 4 dask workers, checksum: 5668890624.0
+#   It took 122 seconds to run on host pp401 using device cpu, consumed memory  6.14 GB, using 4 dask workers, checksum: 5668890624.0
+#   Compute took 97 seconds to run on host pp401 using device cpu, consumed memory  7.36 GB, using 6 dask workers, checksum: 5668890624.0
+#   It took 112 seconds to run on host pp401 using device cpu, consumed memory  6.14 GB, using 6 dask workers, checksum: 5668890624.0
+#   Compute took 96 seconds to run on host pp401 using device cpu, consumed memory  8.59 GB, using 12 dask workers, checksum: 5668890624.0
+#   It took 111 seconds to run on host pp401 using device cpu, consumed memory  6.14 GB, using 12 dask workers, checksum: 5668890624.0
 #
 #block_reshape_da_yx --dask_workers 2 with serial write:
 #  Crashes on pp401 while reading or computing
