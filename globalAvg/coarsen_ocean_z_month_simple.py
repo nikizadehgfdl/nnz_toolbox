@@ -525,7 +525,9 @@ if __name__ == "__main__":
     chunk_size=int(ntime/nchunks)
     tstart=range(0,ntime,chunk_size)
 
-    serial_write = True
+    serial_write = False  #Use mutliprocesses to write chunks in parallel, or write serially in a loop. Parallel writes can be faster but may cause more memory usage and I/O contention, especially if the output file is on a network filesystem. 
+                          #Serial writes are simpler and may be more stable for large files, but can be slower. 
+                          # You can experiment with both options to see which works better for your use case and system configuration.
 
     if args.dask_write:
         # single-file write via dask (parallel if a Dask client is active)
@@ -669,6 +671,9 @@ if __name__ == "__main__":
 #   It took 112 seconds to run on host pp401 using device cpu, consumed memory  6.14 GB, using 6 dask workers, checksum: 5668890624.0
 #   Compute took 96 seconds to run on host pp401 using device cpu, consumed memory  8.59 GB, using 12 dask workers, checksum: 5668890624.0
 #   It took 111 seconds to run on host pp401 using device cpu, consumed memory  6.14 GB, using 12 dask workers, checksum: 5668890624.0
+# 6vars with multicore write:
+#   Compute took 558 seconds to run on host pp401 using device cpu, consumed memory 37.01 GB, using 6 dask workers, checksum: 2710719237373888.0
+#   It took 621 seconds to run on host pp401 using device cpu, consumed memory 35.71 GB, using 6 dask workers, checksum: 2710719237373888.0
 #
 #block_reshape_da_yx --dask_workers 2 with serial write:
 #  Crashes on pp401 while reading or computing
