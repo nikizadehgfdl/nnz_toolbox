@@ -49,7 +49,7 @@ def compute_global_avg(inputfile: str,
                        tdim: str = "time",
                        n_workers: int = None,
                        threads_per_worker: int = 1,
-                       memory_limit: str = "8GB",
+                       memory_limit: str = "32GB",
                        time_chunk: int = 1,
                        outpath: str = None,
                        device: str = None,
@@ -82,7 +82,7 @@ def compute_global_avg(inputfile: str,
         # Load volcello (weights)
         volcello_file = staticfile
         logger.info("Loading volcello from %s", volcello_file)
-        ds_vol = xr.open_dataset(volcello_file,chunks=-1) # decode_times=False
+        ds_vol = xr.open_dataset(volcello_file, decode_times = False, chunks=-1) # decode_times=False
         volcello = ds_vol['volcello'][-1].fillna(0)
 
         # total volume (scalar)
@@ -93,7 +93,7 @@ def compute_global_avg(inputfile: str,
             totalvolume = np.sum(volcello.values)
 
         logger.info("Opening variable dataset: %s", inputfile)
-        ds_var = xr.open_dataset(inputfile, chunks={tdim: time_chunk}) # decode_times=False
+        ds_var = xr.open_dataset(inputfile, chunks={tdim: time_chunk})
 
         for var in vars_to_process:
             # Don't load entire array at once - use lazy loading
@@ -101,9 +101,9 @@ def compute_global_avg(inputfile: str,
             global_avg_da = []
             
             # Get dimension info without loading data
-            xsize = var_da.sizes[xdim]
-            ysize = var_da.sizes[ydim]
-            ntimes = var_da.sizes[tdim]
+            xsize = var_da.shape[3] #var_da.sizes[xdim]
+            ysize = var_da.shape[2] #var_da.sizes[ydim]
+            ntimes = var_da.shape[0] #var_da.sizes[tdim]
             print("Debug: variable ", var, " sizes: time=", ntimes, ", y=", ysize, ", x=", xsize)
             # Compute weighted global mean per time index
             # Use explicit multiplication to avoid potential xarray.weighted memory issues
@@ -113,13 +113,23 @@ def compute_global_avg(inputfile: str,
                 ##Cannot mix torch and dask: global_mean.compute() AttributeError: 'Tensor' object has no attribute 'compute'
                 ##var_torch = torch.from_numpy(var_da.values).to(device)
                 ##weighted_sum = torch.sum(var_torch * volcello_torch)
+                print("Debug: Dask array shapes: ", var_da.shape, volcello.shape)
+                ##method 1 - manual weighted mean with dask arrays
                 weighted_sum = (var_da * volcello).sum(dim=[xdim, ydim, zdim])
                 global_mean = weighted_sum / totalvolume
-
+                ##400secs/2 workers,  average value: 3.569357, memory_limit=16GB, lots of dask warnings
+                ##327secs/10 workers, average value: 3.569357, memory_limit=32GB, No dask warnings
+                ##
+                ##method 2 - use xarray's built-in weighted mean
+                #weighted = var_da.weighted(volcello)
+                #global_mean = weighted.mean(dim=[xdim, ydim, zdim])
+                ##597secs/2 workers, average value: 3.569358, memory_limit=16GB, lots dask warnings
+                ##351secs/2 workers, average value: 3.569358, memory_limit=32GB, No dask warnings
                 logger.info("Computing global mean for %s (this will be executed in parallel)", var)
                 global_avg_da = global_mean.compute()
-                
-                global_avg[var] = xr.DataArray(global_avg_da.values, dims=[tdim], coords={tdim: var_da[tdim]}, name=var)               
+                logger.info("Done Computing global mean for %s (this will be executed in parallel)", var)
+                print(global_avg_da)
+                global_avg[var] = xr.DataArray(global_avg_da, dims=[tdim], coords={tdim: var_da[tdim]}, name=var)               
                 #print("dask mean: ",global_avg[var].mean().values)
             
             elif(use_torch):
@@ -208,7 +218,7 @@ def main():
     parser.add_argument("--ncformat", default="NETCDF3_CLASSIC", help="netCDF format to write: NETCDF3_CLASSIC, NETCDF4, NETCDF4_CLASSIC")
     parser.add_argument("--device", default=None, help="Device to use: 'cpu' or 'cuda'")
     parser.add_argument("--dask_workers", type=int, default=None, help="Number of Dask workers")
-    parser.add_argument("--mem", default="16GB", help="Memory limit per Dask worker")
+    parser.add_argument("--mem", default="32GB", help="Memory limit per Dask worker")
     parser.add_argument("--chunk_time", type=int, default=1, help="Time chunk size for processing")   
     parser.add_argument("--spatial_block_size", type=int, default=1024, help="Spatial block size for processing")   
     args = parser.parse_args()
@@ -256,9 +266,13 @@ if __name__ == '__main__':
 #2026-01-28 09:34:10,901 INFO: It took 219 seconds to run on host pp401 using device None, using 10 dask workers, average value: 3.569357
 #2026-01-28 11:13:09,348 INFO: It took 227 seconds to run on host pp401 using device None, using 12 dask workers, average value: 3.569357
 #2026-01-28 11:03:08,702 INFO: It took 224 seconds to run on host pp401 using device None, using 20 dask workers, average value: 3.569357
+#2026-02-24 17:52:20,732 INFO: It took 327 seconds to run on host pp401 using device None, using 2 dask workers, average value: 3.569357
+#2026-02-24 18:13:17,551 INFO: It took 211 seconds to run on host pp401 using device None, using 10 dask workers, average value: 3.569357
+# 
 #torch and numpy
 #2026-01-28 12:47:37,782 INFO: It took 506 seconds to run on host pp401 using device cuda, average value: 3.569368
 #2026-01-28 13:08:57,732 INFO: It took 432 seconds to run on host pp401 using device cuda, average value: nan without .fillna(0)
 #2026-01-28 14:26:14,552 INFO: It took 529 seconds to run on host pp401 using device cuda, average value: 3.569368
 #2026-01-28 14:46:06,630 INFO: It took 600 seconds to run on host pp401 using device cpu, average value: 3.569368
 #2026-01-28 15:01:40,458 INFO: It took 673 seconds to run on host pp401 using device None, average value: 3.569357
+#

@@ -1,0 +1,721 @@
+##
+##Script to coarsen 2D data. Based on a tool from Will Cooke and Matt Harrison used for 1/12 degree ocean model output..
+##
+import xarray as xr
+import numpy as np
+#import matplotlib.pyplot as plt
+import netCDF4 as nc
+import glob
+import argparse
+import os
+import shutil
+import multiprocessing
+import socket
+import time
+import psutil, os
+
+def print_mem(label=''):
+    p = psutil.Process(os.getpid())
+    rss = p.memory_info().rss
+    # include children
+    for c in p.children(recursive=True):
+        rss += c.memory_info().rss
+    print(f"{label} RSS memory: ", rss/1024./1024., "MB")
+    return rss
+
+def cell_methods(dA):
+    try:
+        cm=dA.cell_methods
+    except:
+        return ''
+
+    if cm is not None:
+        cm_ = cm.split(' ')
+        for c in cm_:
+            if c.find('area')>-1:
+                ca=c
+                exit
+            if c.find('sum')>-1:
+                ca=c
+                exit
+        try:
+            cam=ca.split(':')[1]
+        except:
+            return ''
+    else:
+        return ''
+
+    return cam
+
+def stagger(dA):
+    dims_=dA.dims
+    if 'xh' in dims_ and 'yh' in dims_:
+        return 'h'
+    elif 'xq' in dims_ and 'yh' in dims_:
+        return 'Cu'
+    elif 'xh' in dims_ and 'yq' in dims_:
+        return 'Cv'
+    elif 'xq' in dims_ and 'yq' in dims_:
+        return 'q'
+    else:
+        return None
+
+def block_coarsen_xy(da_xr, nagg, how='mean'):
+    """Fast block coarsen for 'h' staggered fields using xr coarsen.
+    """
+    print(f"block_coarsen_xy: how={how}, nagg={nagg}")
+    if how == 'sum':
+        return da_xr.coarsen(xh=nagg).sum().coarsen(yh=nagg).sum().compute()
+    else:
+        return da_xr.coarsen(xh=nagg).mean().coarsen(yh=nagg).mean().compute()
+
+def block_coarsen_yx(da_xr, nagg, how='mean'):
+    """Fast block coarsen for 'h' staggered fields using xr coarsen.
+    """
+    print(f"block_coarsen_yx: how={how}, nagg={nagg}")
+    if how == 'sum':
+        return da_xr.coarsen(yh=nagg).sum().coarsen(xh=nagg).sum().compute()
+    else:
+        return da_xr.coarsen(yh=nagg).mean().coarsen(xh=nagg).mean().compute()
+
+def block_coarsen_da_yx(da_xr, var_name, nagg, stagger='h', how='mean', time_chunk_size=1):
+    """Fast block coarsen using dask coarsen. 
+       This gives the same answers as block_reshape_da_yx and has a similar runtime and memory usage.
+       This must be called after chunking the input DataArray by time, otherwise the reshape will not work
+       because the data will be a numpy array instead of a dask array. 
+       The output is computed at the end to return a concrete DataArray, 
+       but the intermediate steps are lazy and should not consume much memory. 
+       The reshape is done in y,x order to be more cache-friendly for Fortran-style arrays. 
+       The stagger argument specifies the grid staggering of the input variable, which determines how the coarsening is done.
+    """
+    import dask.array as da
+
+    print(f"block_coarsen_da_yx: varname={var_name}, how={how}, nagg={nagg}")
+    print(f"Use at least --dask_workers 1 to chunk the input DataArray by time for better performance and lower memory usage.")
+    #
+    #var = da_xr.chunk({'time': time_chunk_size}).data #lazy 
+    # .chunk is essential, otherwise var would be a numpy array and does not have .compute() method
+    #The input DataArray must be chunked by time before calling this function
+    #
+    var = da_xr.data #lazy
+    #if not hasattr(var, 'chunks'):
+    #    raise ValueError("Input DataArray must be chunked by time before calling block_reshape_da_yx, use --dask_workers > 0.")
+    #    It will run, but slow
+
+    ntime = var.shape[0]
+    nz = var.shape[1]
+    nlat = var.shape[2]
+    nlon = var.shape[3]
+    nlat_coarse = nlat // nagg
+    nlon_coarse = nlon // nagg
+
+    # Build new coordinates to return a proper DataArray.
+    coords = {}
+    coords['time'] = da_xr['time'].values[:ntime]
+    coords['z_l'] = da_xr['z_l'].values[:nz]
+
+    if stagger == 'h':
+        if how == 'sum':
+            var_coarse =  da.coarsen(np.sum, var, {2: nagg, 3: nagg}, trim_excess=True)
+        else:
+            #want  : da_xr.coarsen(xh=args.nagg).mean().coarsen(yh=args.nagg).mean()
+            #faster: da_xr.coarsen(yh=nagg).mean().coarsen(xh=nagg).mean()
+            var_coarse =  da.coarsen(np.mean, var, {2: nagg, 3: nagg}, trim_excess=True)
+
+        coords['yh'] = da_xr['yh'].values[:nlat].reshape(nlat_coarse, nagg).mean(axis=1)
+        coords['xh'] = da_xr['xh'].values[:nlon].reshape(nlon_coarse, nagg).mean(axis=1)
+        dims = ['time', 'z_l', 'yh', 'xh']
+    elif stagger == 'Cu':
+        if how == 'sum':
+            #want:  da_xr[:,:,:,::args.nagg].coarsen(yh=args.nagg).sum()
+            #var_coarse = var[:,:,:,::nagg]
+            #var_coarse = var_coarse.reshape(ntime, nz, nlat_coarse, nagg, nlon_coarse).sum(axis=3).compute()
+            ##faster if flip x,y order
+            var_coarse = da.coarsen(np.sum, var, {2: nagg}, trim_excess=True)
+            var_coarse = var_coarse[:,:,:,::nagg]
+            #print('var_coarse.shape:', var_coarse.shape)
+        else:
+            var_coarse = da.coarsen(np.mean, var, {2: nagg}, trim_excess=True)
+            var_coarse = var_coarse[:,:,:,::nagg]
+
+        coords['yh'] = da_xr['yh'].values[:nlat].reshape(nlat_coarse, nagg).mean(axis=1)
+        coords['xq'] = da_xr['xq'].values[::nagg]
+        dims = ['time', 'z_l', 'yh', 'xq']
+    elif stagger == 'Cv':
+        if how == 'sum':
+            #want: da_xr[:,:,::args.nagg,:].coarsen(xh=args.nagg).sum()
+            #faster if flip x,y order
+            var_coarse = da.coarsen(np.sum, var, {3: nagg}, trim_excess=True)
+            var_coarse = var_coarse[:,:,::nagg,:]
+        else:
+            var_coarse = da.coarsen(np.mean, var, {3: nagg}, trim_excess=True)
+            var_coarse = var_coarse[:,:,::nagg,:]
+
+        coords['yq'] = da_xr['yq'].values[::nagg]
+        coords['xh'] = da_xr['xh'].values[:nlon].reshape(nlon_coarse, nagg).mean(axis=1)
+        dims = ['time', 'z_l', 'yq', 'xh']
+
+    da_coarse = xr.DataArray(var_coarse, dims=dims, coords=coords, attrs=da_xr.attrs, name=var_name)
+    return da_coarse.compute()
+
+def block_reshape_da_yx(da_xr, var_name, nagg, stagger='h', how='mean', time_chunk_size=1):
+    """Fast block coarsen using numpy/dask reshape. 
+       This gives the same answers as block_coarsen_da_yx and has a similar runtime and memory usage.
+       This must be called after chunking the input DataArray by time, otherwise the reshape will not work
+       because the data will be a numpy array instead of a dask array. 
+       The output is computed at the end to return a concrete DataArray, 
+       but the intermediate steps are lazy and should not consume much memory. 
+       The reshape is done in y,x order to be more cache-friendly for Fortran-style arrays. 
+       The stagger argument specifies the grid staggering of the input variable, which determines how the coarsening is done.
+    """
+    print(f"block_reshape_da_yx: varname={var_name}, how={how}, nagg={nagg}")
+    print(f"Use at least --dask_workers 1 to chunk the input DataArray by time for better performance and lower memory usage.")
+    #
+    #var = da_xr.chunk({'time': time_chunk_size}).data #lazy 
+    # .chunk is essential, otherwise var would be a numpy array and does not have .compute() method
+    #The input DataArray must be chunked by time before calling this function
+    #
+    var = da_xr.data #lazy
+    #if not hasattr(var, 'chunks'):
+    #    raise ValueError("Input DataArray must be chunked by time before calling block_reshape_da_yx, use --dask_workers > 0.")
+    #    It will run, but slow
+
+    ntime = var.shape[0]
+    nz = var.shape[1]
+    nlat = var.shape[2]
+    nlon = var.shape[3]
+    nlat_coarse = nlat // nagg
+    nlon_coarse = nlon // nagg
+
+    # Build new coordinates to return a proper DataArray.
+    coords = {}
+    coords['time'] = da_xr['time'].values[:ntime]
+    coords['z_l'] = da_xr['z_l'].values[:nz]
+
+    if stagger == 'h':
+        if how == 'sum':
+            var_coarse = var.reshape(ntime, nz, nlat_coarse, nagg, nlon).sum(axis=3)
+            var_coarse = var_coarse.reshape(ntime, nz, nlat_coarse, nlon_coarse, nagg).sum(axis=4)
+        else:
+            #want  : da_xr.coarsen(xh=args.nagg).mean().coarsen(yh=args.nagg).mean()
+            #faster: da_xr.coarsen(yh=nagg).mean().coarsen(xh=nagg).mean()
+            var_coarse = var.reshape(ntime, nz, nlat_coarse, nagg, nlon).mean(axis=3)
+            var_coarse = var_coarse.reshape(ntime, nz, nlat_coarse, nlon_coarse, nagg).mean(axis=4)
+
+        coords['yh'] = da_xr['yh'].values[:nlat].reshape(nlat_coarse, nagg).mean(axis=1)
+        coords['xh'] = da_xr['xh'].values[:nlon].reshape(nlon_coarse, nagg).mean(axis=1)
+        dims = ['time', 'z_l', 'yh', 'xh']
+    elif stagger == 'Cu':
+        if how == 'sum':
+            #want:  da_xr[:,:,:,::args.nagg].coarsen(yh=args.nagg).sum()
+            #var_coarse = var[:,:,:,::nagg]
+            #var_coarse = var_coarse.reshape(ntime, nz, nlat_coarse, nagg, nlon_coarse).sum(axis=3).compute()
+            ##faster if flip x,y order
+            var_coarse = var.reshape(ntime, nz, nlat_coarse, nagg, nlon).sum(axis=3)
+            var_coarse = var_coarse[:,:,:,::nagg]
+            #print('var_coarse.shape:', var_coarse.shape)
+        else:
+            var_coarse = var.reshape(ntime, nz, nlat_coarse, nagg, nlon).mean(axis=3)
+            var_coarse = var_coarse[:,:,:,::nagg]
+
+        coords['yh'] = da_xr['yh'].values[:nlat].reshape(nlat_coarse, nagg).mean(axis=1)
+        coords['xq'] = da_xr['xq'].values[::nagg]
+        dims = ['time', 'z_l', 'yh', 'xq']
+    elif stagger == 'Cv':
+        if how == 'sum':
+            #want: da_xr[:,:,::args.nagg,:].coarsen(xh=args.nagg).sum()
+            #var_coarse = var[:,:,::nagg,:]
+            #var_coarse = var_coarse.reshape(ntime, nz, nlat_coarse, nlon_coarse, nagg).sum(axis=4)
+            #faster if flip x,y order
+            var_coarse = var.reshape(ntime, nz, nlat, nlon_coarse, nagg).sum(axis=4)
+            var_coarse = var_coarse[:,:,::nagg,:]
+        else:
+            var_coarse = var[:,:,::nagg,:]
+            var_coarse = var_coarse.reshape(ntime, nz, nlat_coarse, nlon_coarse, nagg).mean(axis=4)
+
+        coords['yq'] = da_xr['yq'].values[::nagg]
+        coords['xh'] = da_xr['xh'].values[:nlon].reshape(nlon_coarse, nagg).mean(axis=1)
+        dims = ['time', 'z_l', 'yq', 'xh']
+
+    da_coarse = xr.DataArray(var_coarse, dims=dims, coords=coords, attrs=da_xr.attrs, name=var_name)
+    return da_coarse.compute()
+
+def block_reshape_np_yx(da_xr, var_name, nagg, how='mean'):
+    """Fast block coarsen for 'h' staggered fields using numpy reshape.
+    """
+    print(f"block_reshape_np_yx: how={how}, nagg={nagg}")
+    ntime = da_xr.shape[0]
+    nz = da_xr.shape[1]
+    nlat = da_xr.shape[2]
+    nlon = da_xr.shape[3]
+    nlat_coarse = nlat // nagg
+    nlon_coarse = nlon // nagg
+    var = da_xr.values
+    if how == 'sum':
+        var_coarse = var.reshape(ntime, nz, nlat_coarse, nagg, nlon).sum(axis=3)
+        var_coarse = var_coarse.reshape(ntime, nz, nlat_coarse, nlon_coarse, nagg).sum(axis=4)
+    else:
+        var_coarse = var.reshape(ntime, nz, nlat_coarse, nagg, nlon).mean(axis=3)
+        var_coarse = var_coarse.reshape(ntime, nz, nlat_coarse, nlon_coarse, nagg).mean(axis=4)
+
+    # Build new coordinates to return a proper DataArray. This is a bit tricky because we need to trim the original coordinates to match the coarsened dimensions, and then take the mean of the coordinates within each block to get the new coordinate values. We also need to make sure to keep the time and z_l coordinates unchanged.
+    coords = {}
+    coords['time'] = da_xr['time'].values[:ntime]
+    coords['z_l'] = da_xr['z_l'].values[:nz]
+    # Block average coordinates for yh and xh
+    coords['yh'] = da_xr['yh'].values[:nlat].reshape(nlat_coarse, nagg).mean(axis=1)
+    coords['xh'] = da_xr['xh'].values[:nlon].reshape(nlon_coarse, nagg).mean(axis=1)
+
+    dims = ['time', 'z_l', 'yh', 'xh']
+    da_coarse = xr.DataArray(var_coarse, dims=dims, coords=coords, attrs=da_xr.attrs, name=var_name)
+    return da_coarse
+
+def block_reshape_np_xy(da_xr, var_name, nagg, how='mean'):
+    """Fast block coarsen for 'h' staggered fields using numpy reshape.
+    """
+    print(f"block_reshape_np_xy: how={how}, nagg={nagg}")
+    ntime = da_xr.shape[0]
+    nz = da_xr.shape[1]
+    nlat = da_xr.shape[2]
+    nlon = da_xr.shape[3]
+    nlat_coarse = nlat // nagg
+    nlon_coarse = nlon // nagg
+    var = da_xr.values
+    if how == 'sum':
+        var_coarse = var.reshape(ntime, nz, nlat, nlon_coarse, nagg).sum(axis=4)
+        var_coarse = var_coarse.reshape(ntime, nz, nlat_coarse, nagg, nlon).sum(axis=3)
+    else:
+        var_coarse = var.reshape(ntime, nz, nlat, nlon_coarse, nagg).mean(axis=4)
+        var_coarse = var_coarse.reshape(ntime, nz, nlat_coarse, nagg, nlon_coarse).mean(axis=3)
+        #_yx
+        #var_coarse = var.reshape(ntime, nz, nlat_coarse, nagg, nlon).mean(axis=3)
+        #var_coarse = var_coarse.reshape(ntime, nz, nlat_coarse, nlon_coarse, nagg).mean(axis=4)
+
+    # Build new coordinates to return a proper DataArray. This is a bit tricky because we need to trim the original coordinates to match the coarsened dimensions, and then take the mean of the coordinates within each block to get the new coordinate values. We also need to make sure to keep the time and z_l coordinates unchanged.
+    coords = {}
+    coords['time'] = da_xr['time'].values[:ntime]
+    coords['z_l'] = da_xr['z_l'].values[:nz]
+    # Block average coordinates for yh and xh
+    coords['yh'] = da_xr['yh'].values[:nlat].reshape(nlat_coarse, nagg).mean(axis=1)
+    coords['xh'] = da_xr['xh'].values[:nlon].reshape(nlon_coarse, nagg).mean(axis=1)
+
+    dims = ['time', 'z_l', 'yh', 'xh']
+    da_coarse = xr.DataArray(var_coarse, dims=dims, coords=coords, attrs=da_xr.attrs, name=var_name)
+    return da_coarse
+
+def block_reshape_torch_yx(da_xr, var_name, nagg, how='mean',device='cpu'):
+    """Fast block coarsen for 'h' staggered fields using torch tensor reshape.
+    """
+    import torch
+    device = torch.device(device)
+
+    print(f"block_reshape_torch_yx: how={how}, nagg={nagg}, device={device}")
+    ntime = da_xr.shape[0]
+    nz = da_xr.shape[1]
+    nlat = da_xr.shape[2]
+    nlon = da_xr.shape[3]
+    nlat_coarse = nlat // nagg
+    nlon_coarse = nlon // nagg
+    var = da_xr.values
+
+    var_torch = torch.from_numpy(var).to(device)
+
+    if how == 'sum':
+        var_coarse = var_torch.reshape(ntime, nz, nlat_coarse, nagg, nlon).sum(dim=3)
+        var_coarse = var_coarse.reshape(ntime, nz, nlat_coarse, nlon_coarse, nagg).sum(dim=4)
+    else:
+        var_coarse = var_torch.reshape(ntime, nz, nlat_coarse, nagg, nlon).mean(dim=3)
+        var_coarse = var_coarse.reshape(ntime, nz, nlat_coarse, nlon_coarse, nagg).mean(dim=4)
+
+    # Build new coordinates to return a proper DataArray. This is a bit tricky because we need to trim the original coordinates to match the coarsened dimensions, and then take the mean of the coordinates within each block to get the new coordinate values. We also need to make sure to keep the time and z_l coordinates unchanged.
+    coords = {}
+    coords['time'] = da_xr['time'].values[:ntime]
+    coords['z_l'] = da_xr['z_l'].values[:nz]
+    # Block average coordinates for yh and xh
+    coords['yh'] = da_xr['yh'].values[:nlat].reshape(nlat_coarse, nagg).mean(axis=1)
+    coords['xh'] = da_xr['xh'].values[:nlon].reshape(nlon_coarse, nagg).mean(axis=1)
+
+    dims = ['time', 'z_l', 'yh', 'xh']
+    da_coarse = xr.DataArray(var_coarse.cpu().numpy(), dims=dims, coords=coords, attrs=da_xr.attrs, name=var_name)
+    return da_coarse
+
+def sum_to_scalar(da):
+    """Return the sum of a DataArray as a Python scalar, computing dask if necessary."""
+    s = da.sum()
+    data = getattr(s, 'data', s)
+    if hasattr(data, 'compute'):
+        data = data.compute()
+    arr = np.asarray(data)
+    try:
+        return arr.item()
+    except Exception:
+        return float(arr)
+
+def save_timeslice(ds,i,n,ntime):
+    fout_tmp='tmpdir_ocean_month_z/om_'+str(i).zfill(4)+'.nc'
+    print('process id:', os.getpid(),fout_tmp)
+    ds.isel(time=slice(i,min(i+n,ntime))).to_netcdf(fout_tmp,unlimited_dims=['time',],compute=True)
+
+def save_dataset_dask(ds, path, unlimited_dims=['time']):
+    """Write Dataset via xarray+dask: to_netcdf(compute=False) then dask.compute."""
+    print(f"Saving dataset via dask to {path}")
+    try:
+        delayed = ds.to_netcdf(path, mode='w', unlimited_dims=unlimited_dims, compute=False)
+    except TypeError:
+        # backend doesn't support delayed write
+        print("Backend doesn't support delayed write; performing direct write")
+        return ds.to_netcdf(path, unlimited_dims=unlimited_dims)
+
+    try:
+        import dask
+        dask.compute(delayed)
+    except Exception as e:
+        print("Dask compute failed, falling back to direct write:", e)
+        return ds.to_netcdf(path, unlimited_dims=unlimited_dims)
+    
+##########################    
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='''Script for implied atmospheric meridional moisture transport.''')
+    parser.add_argument('-f','--inputfile', type=str, default='foo.nc', help='''input filepath ''')
+    parser.add_argument('-n','--nagg', type=int, default=3, help='''year ''')
+    parser.add_argument('--varname', type=str, nargs='+', default=['all'], help='''Name(s) of the variable(s) to coarsen. Default is "all", which means all variables will be coarsened.''')
+    parser.add_argument('--uname', type=str, default='umo', help='''Name of the u-component of mass transport''')
+    parser.add_argument('--vname', type=str, default='vmo', help='''Name of the v-component of mass transport''')
+    parser.add_argument('--wrapx', type=bool, default=True, help='''True if the x-component is reentrant''')
+    parser.add_argument('--wrapy', type=bool, default=False, help='''True if the y-component is reentrant''')
+    parser.add_argument('--dask_workers', type=int, default=0, help='''Number of Dask workers to use. Default is 1, which means no Dask parallelization.''')
+    parser.add_argument('--dask_write', action='store_true', help='Use dask to perform the final to_netcdf write (to_netcdf(compute=False) then compute)')
+    parser.add_argument('-o','--outputfile', type=str, default='foo.nc', help='''output filepath ''')
+
+    args = parser.parse_args()
+
+    t1 = time.time()
+    device = 'cpu'
+
+    if not os.path.isdir('tmpdir_ocean_month_z'):
+        os.mkdir('tmpdir_ocean_month_z')
+
+    print_mem('Start of the script')
+
+    n_workers = args.dask_workers
+    threads_per_worker = 1
+    if(args.dask_workers > 1):
+        # Start Dask cluster
+        from dask.distributed import Client, LocalCluster
+        memory_limit = '32GB' #32G seems to be eough for 1/12th degree ocean data on PAN
+        print("Starting Dask LocalCluster: workers=%s threads=%s mem=%s",
+                n_workers, threads_per_worker, memory_limit)
+        cluster = LocalCluster(n_workers=n_workers, threads_per_worker=threads_per_worker, memory_limit=memory_limit)
+        client = Client(cluster)
+        print("Dask client started. Dashboard: %s", client.dashboard_link)
+
+    path=args.inputfile
+    time_chunk_size=None
+    if args.dask_workers >= 1:
+        time_chunk_size = 1  # Adjust this based on your memory constraints and dataset size
+    ds=xr.open_dataset(path, decode_times = False, chunks={'time': time_chunk_size} if args.dask_workers >= 1 else None)
+    dA_i=[];dA_e=[];
+    #dA_i_=[];dA_e_=[] #unused
+
+    print_mem('After open_dataset calls')
+    exclude_list=['uo','vo','wo'] # These will be calculated later.
+
+    ntime=ds['thetao'].shape[0]
+    for nm in ds.data_vars:
+        if nm in exclude_list:
+            print(nm+" will be calculated later. Ignoring variable in original file.")
+            continue
+        if args.varname != ['all'] and nm not in args.varname:
+            print(nm+" was not requested in the args. Ignoring variable in original file.")
+            continue
+
+        ds_nm = ds[nm] #to read one variable at a time and reduce memory usage. No, that doesn't do it.
+
+        s_=stagger(ds_nm)
+        print(nm,s_, cell_methods(ds_nm))
+        if cell_methods(ds_nm).find('sum')>-1:
+            #dA_e_.append(ds_nm)
+            if s_ == 'h':
+                #dA_e.append(ds_nm.coarsen(xh=args.nagg).sum().coarsen(yh=args.nagg).sum()) #original, slow
+                #dA_e.append(block_reshape_da_yx(ds_nm, nm, args.nagg, how='sum')) #dask reshape
+                dA_e.append(block_coarsen_da_yx(ds_nm, nm, args.nagg, how='sum'))  #dask coarsen
+            elif s_ == 'Cu':
+                #dA_e.append(ds_nm[:,:,:,::args.nagg].coarsen(yh=args.nagg).sum()) #original, slow
+                #dA_e.append(block_reshape_da_yx(ds_nm, nm, args.nagg, stagger='Cu', how='sum')) #dask reshape
+                dA_e.append(block_coarsen_da_yx(ds_nm, nm, args.nagg, stagger='Cu', how='sum')) #dask coarsen
+            elif s_ == 'Cv':
+                #dA_e.append(ds_nm[:,:,::args.nagg,:].coarsen(xh=args.nagg).sum()) #original, slow
+                #dA_e.append(block_reshape_da_yx(ds_nm, nm, args.nagg, stagger='Cv', how='sum')) #dask reshape
+                dA_e.append(block_coarsen_da_yx(ds_nm, nm, args.nagg, stagger='Cv', how='sum')) #dask coarsen     
+            elif s_ == 'q':
+                print(nm,' at corners')
+        elif cell_methods(ds_nm).find('mean')>-1:
+            #dA_i_.append(ds_nm)
+            if s_ == 'h':
+                #dA_i.append(ds_nm.coarsen(xh=args.nagg).mean().coarsen(yh=args.nagg).mean()) #original, slow
+                #dA_i.append(ds_nm.coarsen(yh=args.nagg).mean().coarsen(xh=args.nagg).mean()) #original xy flip, faster
+                #dA_i.append(block_reshape_da_yx(ds_nm, nm, args.nagg, stagger='h', how='mean')) #dask reshape
+                dA_i.append(block_coarsen_da_yx(ds_nm, nm, args.nagg, stagger='h', how='mean')) #dask coarsen
+                #dA_i.append(block_coarsen_xy(ds_nm, args.nagg, how='mean')) #original, xarray coarsen, slow
+                #dA_i.append(block_coarsen_yx(ds_nm, args.nagg, how='mean')) #original, xarray coarsen xy order flipped, faster
+                #dA_i.append(block_reshape_np_yx(ds_nm, nm, args.nagg, how='mean')) #numpy
+                #dA_i.append(block_reshape_np_xy(ds_nm, nm, args.nagg, how='mean')) #numpy xy order flipped, faster
+                #dA_i.append(block_reshape_torch_yx(ds_nm, nm, args.nagg, how='mean')) #torch, a little faster than numpy
+            elif s_ == 'Cu':
+                #dA_i.append(ds_nm[:,:,:,::args.nagg].coarsen(yh=args.nagg).mean())
+                dA_i.append(block_coarsen_da_yx(ds_nm, nm, args.nagg, stagger='Cu', how='mean'))
+            elif s_ == 'Cv':
+                dA_i.append(block_coarsen_da_yx(ds_nm, nm, args.nagg, stagger='Cv', how='mean'))
+            elif s_ == 'q':
+                dA_i.append(ds_nm[:,:,::args.nagg,::args.nagg])
+        else:
+            print(nm,' has no cell method or an unrecognized cell method. Treating as mean.')
+            #dA_i_.append(ds_nm)
+            if s_ == 'h':
+                #dA_i.append(ds_nm.coarsen(xh=args.nagg).mean().coarsen(yh=args.nagg).mean())
+                dA_i.append(block_coarsen_da_yx(ds_nm, nm, args.nagg, stagger='h', how='mean'))
+            elif s_ == 'Cu':
+                #dA_i.append(ds_nm[:,:,:,::args.nagg].coarsen(yh=args.nagg).mean())
+                dA_i.append(block_coarsen_da_yx(ds_nm, nm, args.nagg, stagger='Cu', how='mean'))
+            elif s_ == 'Cv':
+                #dA_i.append(ds_nm[:,:,::args.nagg,:].coarsen(xh=args.nagg).mean())
+                dA_i.append(block_coarsen_da_yx(ds_nm, nm, args.nagg, stagger='Cv', how='mean'))
+            elif s_ == 'q':
+                dA_i.append(ds_nm[:,:,::args.nagg,::args.nagg])
+
+        #release the memory used by ds_nm
+        del ds_nm
+
+    print_mem('After computing coarsened variables')
+    # make a checksum to compare with different runs (safe for dask-backed arrays)
+    checksum = sum([sum_to_scalar(d) for d in dA_i]) + sum([sum_to_scalar(d) for d in dA_e])
+    rss = print_mem('At the end of compuations')
+    t2 = time.time()
+    elapsed = int(t2 - t1)
+    mem_gb = rss / 1024.0 / 1024.0 / 1024.0
+    print(f"Compute took {elapsed} seconds to run on host {socket.gethostname()} using device {device}, consumed memory {mem_gb:5.2f} GB, using {n_workers * threads_per_worker} dask workers, checksum: {checksum}")
+
+
+    #Close Dask cluster if it was started
+    if(args.dask_workers > 1):
+        try:
+            client.close()
+            cluster.close()
+        except Exception:
+            pass
+
+    time_bnds=ds['time_bnds']
+
+
+    ds_out=xr.merge([xr.merge(dA_e),xr.merge(dA_i),time_bnds])
+
+    nchunks=ntime
+    chunk_size=int(ntime/nchunks)
+    tstart=range(0,ntime,chunk_size)
+
+    serial_write = False  #Use mutliprocesses to write chunks in parallel, or write serially in a loop. Parallel writes can be faster but may cause more memory usage and I/O contention, especially if the output file is on a network filesystem. 
+                          #Serial writes are simpler and may be more stable for large files, but can be slower. 
+                          # You can experiment with both options to see which works better for your use case and system configuration.
+
+    if args.dask_write:
+        # single-file write via dask (parallel if a Dask client is active)
+        save_dataset_dask(ds_out, args.outputfile, unlimited_dims=['time'])
+    else:
+        if serial_write:
+            # Serial writes (no child processes)
+            for n in np.arange(nchunks):
+                print(f"Writing chunk {n} starting at time index {tstart[n]}", flush=True)
+                try:
+                    save_timeslice(ds_out, tstart[n], chunk_size, ntime)
+                except Exception as e:
+                    print(f"Error writing chunk {n}: {e}", flush=True)
+            print('Serial write complete.')
+        else:
+            p=[]
+            for n in np.arange(nchunks):
+                p.append(multiprocessing.Process(target=save_timeslice,args=(ds_out,tstart[n],chunk_size,ntime)))
+            print("Deubg: Here1")
+            for p_ in p:
+                p_.start()
+            print("Deubg: Here2")
+            for p_ in p:
+                p_.join()
+            print(' Multicore write process complete.')
+
+    checksum = sum([sum_to_scalar(d) for d in dA_i]) + sum([sum_to_scalar(d) for d in dA_e])
+
+    rss = print_mem('At the end of the script')
+    t2 = time.time()
+    elapsed = int(t2 - t1)
+    mem_gb = rss / 1024.0 / 1024.0 / 1024.0
+    print(f"It took {elapsed} seconds to run on host {socket.gethostname()} using device {device}, consumed memory {mem_gb:5.2f} GB, using {n_workers * threads_per_worker} dask workers, checksum: {checksum}")
+
+#02172026 year 198
+# /usr/bin/time -v python /nbhome/Niki.Zadeh/projects/nnz_toolbox/globalAvg/coarsen_ocean_z_month_simple.py -f ./01980101.ocean_z_month.nc --staticFile ./01980101.ocean_static.nc --nagg 3 --varname thetao
+#xr.coarsen_xy : It took 341 seconds to run on host pp401 using device cpu, consumed memory 59.38 GB, using 1 dask workers, checksum: 5804720640.0
+#xr.coarsen_yx : It took 279 seconds to run on host pp401 using device cpu, consumed memory 59.38 GB, using 1 dask workers, checksum: 5804720128.0
+#block_coarsen_xy : It took 324 seconds to run on host pp401 using device cpu, consumed memory 59.38 GB, using 1 dask workers, checksum: 5804720640.0
+#block_coarsen_yx : It took 255 seconds to run on host pp401 using device cpu, consumed memory 59.38 GB, using 1 dask workers, checksum: 5804720128.0
+#block_reshape_np_xy : It took 221 seconds to run on host pp401 using device cpu, consumed memory 59.38 GB, using 1 dask workers, checksum: 5668890624.0
+#block_reshape_np_yx : It took 170 seconds to run on host pp401 using device cpu, consumed memory 59.38 GB, using 1 dask workers, checksum: 5668890624.0
+#block_reshape_np_yx : It took 204 seconds to run on host pp401 using device cpu, consumed memory 59.38 GB, using 1 dask workers, checksum: 5668890624.0
+#block_reshape_np_yx  6vars: It took 1607 seconds to run on host pp401 using device cpu, consumed memory 246.97 GB, using 1 dask workers, checksum: 2710650350911424.0
+#block_reshape_torch_yx: It took 149 seconds to run on host pp401 using device cpu, consumed memory 59.66 GB, using 1 dask workers, checksum: 5668890624.0
+#numpy+dask,  numpy answers, less memory foot print even with 1 worker!
+#block_reshape_da_yx : It took 135 seconds to run on host pp401 using device cpu, consumed memory  6.30 GB, using 1 dask workers, checksum: 5668890624.0
+#block_reshape_da_yx 1var : It took 147 seconds to run on host pp401 using device cpu, consumed memory  6.30 GB, using 1 dask workers, checksum: 5668890624.0
+#block_reshape_da_yx 2vars: It took 276 seconds to run on host pp401 using device cpu, consumed memory 12.22 GB, using 1 dask workers, checksum: 30006976512.0
+#block_reshape_da_yx 3vars: It took 474 seconds to run on host pp401 using device cpu, consumed memory 18.16 GB, using 1 dask workers, checksum: 67230810112.0
+#block_reshape_da_yx 6vars: It took 1400 seconds to run on host pp401 using device cpu, consumed memory 36.20 GB, using 1 dask workers, checksum: 2710650350911424.0
+#block_reshape_da_yx 6vars_CuCv: It took 1513 seconds to run on host pp401 using device cpu, consumed memory 36.12 GB, using 1 dask workers, checksum: 2710719237373888.0
+#block_reshape_np_yx 6vars: It took 1607 seconds to run on host pp401 using device cpu, consumed memory 246.97 GB, using 1 dask workers, checksum: 2710650350911424.0
+#
+#thetao
+#(plattorch) Niki.Zadeh: /xtmp/Niki.Zadeh/work/William.Cooke/SPEAR/SPEAR_HI_8/SPEAR_c384_OM4p08_Control_1990_A14 $  /usr/bin/time -v python /nbhome/Niki.Zadeh/projects/nnz_toolbox/globalAvg/coarsen_ocean_z_month_simple.py -f ./01980101.ocean_z_month.nc --staticFile ./01980101.ocean_static.nc --nagg 3 --varname thetao
+#coarsen_original         : It took 354 seconds to run on host pp401 using device cpu, consumed memory 59.37 GB, using 1 dask workers, checksum: 5804720640.0
+#coarsen_original_yx.compute dask_workers 0:
+#coarsen_original_yx.compute dask_workers 1: Hangs at writing outputs on PAN
+#          :
+#block_reshape_da_yx 1var : It took 170 seconds to run on host pp401 using device cpu, consumed memory  6.30 GB, using 1 dask workers, checksum: 5668890624.0
+#umo
+#coarsen_original         : It took 429 seconds to run on host pp401 using device cpu, consumed memory  6.30 GB, using 1 dask workers, checksum: 2711735513382912.0
+#block_reshape_da_yx 1var : It took 412 seconds to run on host pp401 using device cpu, consumed memory  6.50 GB, using 1 dask workers, checksum: 2713882191724544.0
+#block_reshape_da_yx_TR 1var : It took 421 seconds to run on host pp401 using device cpu, consumed memory  6.30 GB, using 1 dask workers, checksum: 2711735513382912.0
+#
+#02182026 year 198, using host c5n1842
+#block_reshape_np_yx : It took 169 seconds to run on host c5n1842 using device cpu, consumed memory 59.35 GB, using 1 dask workers, checksum: 5668890624.0
+#block_coarsen_yx :    It took 325 seconds to run on host c5n1842 using device cpu, consumed memory 59.36 GB, using 1 dask workers, checksum: 5804720128.0
+#block_coarsen_yx :    It took 404 seconds to run on host c5n1842 using device cpu, consumed memory  6.66 GB, using 2 dask workers, checksum: 5804720128.0
+#block_coarsen_yx :    It took 242 seconds to run on host c5n1842 using device cpu, consumed memory  6.70 GB, using 4 dask workers, checksum: 5804720128.0
+#block_coarsen_yx :    It took 187 seconds to run on host c5n0793 using device cpu, consumed memory  6.73 GB, using 8 dask workers, checksum: 5804720128.0
+#block_coarsen_yx :    It took 138 seconds to run on host c5n0793 using device cpu, consumed memory  6.75 GB, using 12 dask workers, checksum: 5804720128.0
+#block_coarsen_yx :
+#block_reshape_da_yx : It took 217 seconds to run on host c5n0793 using device cpu, consumed memory  6.73 GB, using 8 dask workers, checksum: 5668890624.0
+#block_reshape_da_yx : It took 177 seconds to run on host c5n0793 using device cpu, consumed memory  6.75 GB, using 12 dask workers, checksum: 5668890624.0
+
+#block_reshape_da_yx : It took 204 seconds to run on host c5n0793 using device cpu, consumed memory  6.35 GB, using 1 dask workers, checksum: 5668890624.0
+#block_reshape_da_yx : It took 179 seconds to run on host c5n0793 using device cpu, consumed memory  6.76 GB, using 12 dask workers, checksum: 5668890624.0
+#
+#block_reshape_np_yx 6vars: It took 2383 seconds to run on host c5n0793 using device cpu, consumed memory 36.24 GB, using 1 dask workers, checksum: 2710650350911424.0
+#block_reshape_np_yx 6vars: It took 1086 seconds to run on host c5n0793 using device cpu, consumed memory 36.43 GB, using 12 dask workers, checksum: 2710719237373888.0
+#
+#02202026
+#old code /ncrc/home2/Niki.Zadeh/projects/miniconda3/envs/mini/bin/python ~/projects/nnz_toolbox/globalAvg/coarsen_ocean_z_month_simple_workedOnC5Dask.py -f ./01980101.ocean_z_month.nc --staticFile ./01980101.ocean_static.nc --nagg 3 --dask_workers 12
+#block_reshape_np_yx 6vars: It took 1119 seconds to run on host c5n0525 using device cpu, consumed memory 36.42 GB, using 12 dask workers, checksum: 2710719237373888.0
+# added compute clock
+#         Compute took 1077 seconds to run on host c5n0525 using device cpu, consumed memory 41.19 GB, using 12 dask workers, checksum: 2710719237373888.0
+#         It took 1082 seconds to run on host c5n0525 using device cpu, consumed memory 36.40 GB, using 12 dask workers, checksum: 2710719237373888.0
+#
+#new code /ncrc/home2/Niki.Zadeh/projects/miniconda3/envs/mini/bin/python ~/projects/nnz_toolbox/globalAvg/coarsen_ocean_z_month_simple.py -f ./01980101.ocean_z_month.nc --staticFile ./01980101.ocean_static.nc --nagg 3 --dask_workers 12
+#block_reshape_np_yx 6vars: Compute took 1007 seconds to run on host c5n0525 using device cpu, consumed memory 35.21 GB, using 12 dask workers, checksum: 2708565042839488.0
+#                           It took 1756 seconds to run on host c5n0525 using device cpu, consumed memory 37.61 GB, using 12 dask workers, checksum: 2708565042839488.0                   
+#
+#02202026
+#thetao
+#(plattorch) Niki.Zadeh: /xtmp/Niki.Zadeh/work/William.Cooke/SPEAR/SPEAR_HI_8/SPEAR_c384_OM4p08_Control_1990_A14 $  /usr/bin/time -v python /nbhome/Niki.Zadeh/projects/nnz_toolbox/globalAvg/coarsen_ocean_z_month_simple.py -f ./01980101.ocean_z_month.nc --staticFile ./01980101.ocean_static.nc --nagg 3 --varname thetao
+#coarser_original_xy :
+#  Compute took 350 seconds to run on host pp401 using device cpu, consumed memory 59.38 GB, using 0 dask workers, checksum: 5804720640.0
+#  It took 361 seconds to run on host pp401 using device cpu, consumed memory 59.38 GB, using 0 dask workers, checksum: 5804720640.0
+#                      top shows memory usage up to 170GB, but the final RSS is 59.38 GB, which suggests that there may be some temporary memory spikes during the coarsening process
+#coarser_original_yx :
+#  Compute took 314 seconds to run on host pp401 using device cpu, consumed memory 59.37 GB, using 0 dask workers, checksum: 5804720128.0
+#  It took 323 seconds to run on host pp401 using device cpu, consumed memory 59.37 GB, using 0 dask workers, checksum: 5804720128.0
+#    top shows memory usage up to 170GB
+#coarser_original_yx.compute :
+#  Compute took 268 seconds to run on host pp401 using device cpu, consumed memory 59.37 GB, using 0 dask workers, checksum: 5804720128.0
+#  It took 276 seconds to run on host pp401 using device cpu, consumed memory 59.37 GB, using 0 dask workers, checksum: 5804720128.0
+#coarser_original_yx.compute.time_chunk_size_1 : Hangs at writing outputs on PAN
+#  Compute took 172 seconds to run on host pp401 using device cpu, consumed memory  6.30 GB, using 1 dask workers, checksum: 5804720128.0
+#  Hangs at writing outputs on PAN
+#      top shows memory usage up to just under 20GB
+#      ds=xr.open_dataset(path, decode_times = False, chunks={'time': 1}) activates dask chunking along the time dimension, which can help reduce memory usage by processing one time step at a time. This is likely why the memory usage is much lower in this case compared to when no chunking is used.
+#block_reshape_da_yx :
+#  Compute took 163 seconds to run on host pp401 using device cpu, consumed memory  6.30 GB, using 0 dask workers, checksum: 5668890624.0
+#  It took 173 seconds to run on host pp401 using device cpu, consumed memory  6.30 GB, using 0 dask workers, checksum: 5668890624.0
+#block_reshape_da_yx --dask_workers 1 :
+#  Compute took 158 seconds to run on host pp401 using device cpu, consumed memory  6.30 GB, using 1 dask workers, checksum: 5668890624.0
+#  Hangs at writing outputs on PAN
+#block_reshape_da_yx --dask_workers 1 with serial write:
+#  Compute took 157 seconds to run on host pp401 using device cpu, consumed memory  6.30 GB, using 1 dask workers, checksum: 5668890624.0
+#  It took 170 seconds to run on host pp401 using device cpu, consumed memory  6.31 GB, using 1 dask workers, checksum: 5668890624.0
+# return da_coarse.compute() chunk out
+#  Compute took 136 seconds to run on host pp401 using device cpu, consumed memory  6.30 GB, using 1 dask workers, checksum: 5668890624.0
+#  It took 147 seconds to run on host pp401 using device cpu, consumed memory  6.31 GB, using 1 dask workers, checksum: 5668890624.0  
+#  Compute took 176 seconds to run on host pp401 using device cpu, consumed memory 59.37 GB, using 0 dask workers, checksum: 5668890624.0
+#block_coarsen_da_yx thetao: use dask coarsen
+#  Compute took 136 seconds to run on host pp401 using device cpu, consumed memory  6.30 GB, using 1 dask workers, checksum: 5668890624.0
+#  It took 148 seconds to run on host pp401 using device cpu, consumed memory  6.31 GB, using 1 dask workers, checksum: 5668890624.0
+#block_coarsen_da_yx thetao: use dask coarsen with dask_write into single file:
+#  It took 208 seconds to run on host pp401 using device cpu, consumed memory  0.69 GB, using 1 dask workers, checksum: 5668873216.0
+#  suspect, checksum is different
+#block_coarsen_da_yx thetao: use dask coarsen with serial write and memory_limit 32GB:
+#   Compute took 144 seconds to run on host pp401 using device cpu, consumed memory  6.30 GB, using 1 dask workers, checksum: 5668890624.0   
+#   It took 160 seconds to run on host pp401 using device cpu, consumed memory  6.31 GB, using 1 dask workers, checksum: 5668890624.0
+#   Compute took 139 seconds to run on host pp401 using device cpu, consumed memory  6.55 GB, using 2 dask workers, checksum: 5668890624.0
+#   It took 154 seconds to run on host pp401 using device cpu, consumed memory  6.14 GB, using 2 dask workers, checksum: 5668890624.0
+#   Compute took 106 seconds to run on host pp401 using device cpu, consumed memory  6.96 GB, using 4 dask workers, checksum: 5668890624.0
+#   It took 122 seconds to run on host pp401 using device cpu, consumed memory  6.14 GB, using 4 dask workers, checksum: 5668890624.0
+#   Compute took 97 seconds to run on host pp401 using device cpu, consumed memory  7.36 GB, using 6 dask workers, checksum: 5668890624.0
+#   It took 112 seconds to run on host pp401 using device cpu, consumed memory  6.14 GB, using 6 dask workers, checksum: 5668890624.0
+#   Compute took 96 seconds to run on host pp401 using device cpu, consumed memory  8.59 GB, using 12 dask workers, checksum: 5668890624.0
+#   It took 111 seconds to run on host pp401 using device cpu, consumed memory  6.14 GB, using 12 dask workers, checksum: 5668890624.0
+# 6vars with multicore write:
+#   Compute took 558 seconds to run on host pp401 using device cpu, consumed memory 37.01 GB, using 6 dask workers, checksum: 2710719237373888.0
+#   It took 621 seconds to run on host pp401 using device cpu, consumed memory 35.71 GB, using 6 dask workers, checksum: 2710719237373888.0
+#
+#block_reshape_da_yx --dask_workers 2 with serial write:
+#  Crashes on pp401 while reading or computing
+#block_reshape_np_yx:
+#  Compute took 205 seconds to run on host pp401 using device cpu, consumed memory 59.38 GB, using 0 dask workers, checksum: 5668890624.0
+#  It took 217 seconds to run on host pp401 using device cpu, consumed memory 59.39 GB, using 0 dask workers, checksum: 5668890624.0
+#block_reshape_torch_yx:
+#  Compute took 211 seconds to run on host pp401 using device cpu, consumed memory 59.66 GB, using 0 dask workers, checksum: 5668890624.0
+#  It took 224 seconds to run on host pp401 using device cpu, consumed memory 59.67 GB, using 0 dask workers, checksum: 5668890624.0
+#
+#umo
+#original coarsen:    Compute took 388 seconds to run on host pp401 using device cpu, consumed memory  6.30 GB, using 0 dask workers, checksum: 2711735513382912.0
+#block_reshape_da_xy: Compute took 372 seconds to run on host pp401 using device cpu, consumed memory  6.50 GB, using 0 dask workers, checksum: 2713882191724544.0
+#block_reshape_da_yx: 
+# .compute() after .sum() 
+#  chunk in          Compute took 139 seconds to run on host pp401 using device cpu, consumed memory 18.13 GB, using 0 dask workers, checksum: 2713882191724544.0   
+# return da_coarse.compute()
+#  chunk in and out  Compute took 132 seconds to run on host pp401 using device cpu, consumed memory  6.30 GB, using 0 dask workers, checksum: 2713882191724544.0
+#  chunk in and out  Compute took 129 seconds to run on host pp401 using device cpu, consumed memory  6.30 GB, using 1 dask workers, checksum: 2713882191724544.0
+#  chunk out         Compute took 123 seconds to run on host pp401 using device cpu, consumed memory  6.30 GB, using 1 dask workers, checksum: 2713882191724544.0
+#  chunk out         Compute took 164 seconds to run on host pp401 using device cpu, consumed memory 71.20 GB, using 0 dask workers, checksum: 2713882191724544.0 
+# Suspects:
+#  function(...).compute()
+#                Compute took 123 seconds to run on host pp401 using device cpu, consumed memory  0.39 GB, using 0 dask workers, checksum: 2713853469130752.0
+#  no compute() anywhere!  
+#                Compute took 119 seconds to run on host pp401 using device cpu, consumed memory  0.39 GB, using 0 dask workers, checksum: 2713853469130752.0
+#
+#vmo
+#                Compute took 356 seconds to run on host pp401 using device cpu, consumed memory  6.48 GB, using 1 dask workers, checksum: -3231061114880.0
+#  flip xy       Compute took 150 seconds to run on host pp401 using device cpu, consumed memory  6.30 GB, using 1 dask workers, checksum: -3231061114880.0
+#block_coarsen_da_yx:
+#                Compute took 141 seconds to run on host pp401 using device cpu, consumed memory  6.30 GB, using 1 dask workers, checksum: -3231061114880.0
+#                It took 152 seconds to run on host pp401 using device cpu, consumed memory  6.31 GB, using 1 dask workers, checksum: -3231061114880.0
+#
+#block_reshape_da_yx 6vars : 
+#                Compute took 837 seconds to run on host pp401 using device cpu, consumed memory 35.94 GB, using 1 dask workers, checksum: 2710719237373888.0
+#                It took 895 seconds to run on host pp401 using device cpu, consumed memory 36.01 GB, using 1 dask workers, checksum: 2710719237373888.0
+# This last result might have been with a append(function().compute()), repeat without it 
+#
+#block_coarsen_da_yx 6vars : 
+#                Compute took 894 seconds to run on host pp401 using device cpu, consumed memory 35.95 GB, using 1 dask workers, checksum: 2710719237373888.0
+#                It took 961 seconds to run on host pp401 using device cpu, consumed memory 35.96 GB, using 1 dask workers, checksum: 2710719237373888.0
+#             
+#
+#02242026
+#ESM4.5
+#python /nbhome/Niki.Zadeh/projects/nnz_toolbox/globalAvg/downSample_dask.py -f  /archive/Niki.Zadeh/CMIP7/ESM4/DEV/ESM4.5v14_nonsymmetric/gfdl.ncrc5-inteloneapi252-prod-openmp/pp/ocean_monthly_z/ts/monthly/5yr/ocean_monthly_z.000601-001012.thetao.nc --nagg 3 --varname thetao --dask_workers 1 --dask_write -o ./ESM4.5v14_downsample3_thetao.nc
+#Compute took 26 seconds to run on host pp401 using device cpu, consumed memory  1.91 GB, using 1 dask workers, checksum: 910480576.0
+#cm5hires
+#(plattorch) Niki.Zadeh: /xtmp/Niki.Zadeh/work/hiresCM5 $  python /nbhome/Niki.Zadeh/projects/nnz_toolbox/globalAvg/downSample_dask.py -f ocean_monthly_z.000101-000512.thetao.nc --nagg 4 --varname thetao --dask_workers 1 --dask_write -o CM5hires_downsample4_thetao.nc
+#Compute took 363 seconds to run on host pp401 using device cpu, consumed memory 13.37 GB, using 1 dask workers, checksum: 8356301312.0
+#It took 389 seconds to run on host pp401 using device cpu, consumed memory 13.40 GB, using 1 dask workers, checksum: 8356301312.0
+#Compute took 382 seconds to run on host pp401 using device cpu, consumed memory 13.65 GB, using 2 dask workers, checksum: 8356301312.0
+#Compute took 241 seconds to run on host pp401 using device cpu, consumed memory 14.31 GB, using 6 dask workers, checksum: 8356301312.0
+#Compute took 231 seconds to run on host pp401 using device cpu, consumed memory 15.19 GB, using 10 dask workers, checksum: 8356301312.0
+#Compute took 217 seconds to run on host pp401 using device cpu, consumed memory 17.11 GB, using 20 dask workers, checksum: 8356301312.0
+#
